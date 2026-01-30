@@ -1,0 +1,37 @@
+// ============================================================================
+// Polymarket Merge System - Configuration
+// ============================================================================
+
+import dotenv from 'dotenv';
+import path from 'path';
+import { Config } from './types';
+
+// Load environment variables from .env file
+dotenv.config({ path: path.resolve(__dirname, '../.env') });
+
+export const CONFIG: Config = {
+  // Redis
+  REDIS_URL: `redis://${process.env.REDIS_HOST || 'localhost'}:${process.env.REDIS_PORT || '6379'}/${process.env.REDIS_DB || '0'}`,
+  METADATA_KEY_PREFIX: 'pm:metadata:',
+
+  // Blockchain
+  RPC_URL: process.env.RPC_URL || 'https://polygon-rpc.com',
+  CHAIN_ID: Number(process.env.CHAIN_ID) || 137,
+
+  // Encrypted private key
+  ENCRYPT_PRIVATE_KEY: process.env.ENCRYPT_PRIVATE_KEY || '',
+
+  // Asset
+  ASSET: process.env.ASSET || 'bitcoin',
+
+  // Polymarket proxy wallet (where positions are held)
+  PROXY_ADDRESS: process.env.PROXY_ADDRESS || '',
+
+  // Relayer configuration
+  RELAYER_URL: process.env.RELAYER_URL || '',
+  RELAYER_TX_TYPE: process.env.RELAYER_TX_TYPE || 'SAFE',
+
+  // Merge settings
+  MERGE_INTERVAL_MS: 30 * 60 * 1000, // 30 minutes
+  REQUEST_DELAY_MS: 0, // No delay when using Alchemy (has higher rate limits)
+};

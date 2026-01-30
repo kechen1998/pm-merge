@@ -1,0 +1,25 @@
+{
+  "name": "pm-merge",
+  "version": "1.0.0",
+  "description": "Polymarket YES/NO token merger",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@polymarket/builder-relayer-client": "^0.0.8",
+    "@polymarket/builder-signing-sdk": "latest",
+    "crypto-js": "^4.2.0",
+    "dotenv": "^16.4.5",
+    "ioredis": "^5.4.1",
+    "tslib": "^2.8.1",
+    "viem": "^2.45.1"
+  },
+  "devDependencies": {
+    "@types/crypto-js": "^4.2.2",
+    "@types/node": "^20.14.10",
+    "typescript": "^5.5.3"
+  },
+  "private": true
+}
