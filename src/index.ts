@@ -165,6 +165,9 @@ async function main(): Promise<void> {
 
           const response = await relayer.execute([tx], `merge ${market.marketSlug || market.conditionId}`);
           const result = await response.wait();
+          if (!result) {
+            throw new Error('Relayer returned no result.');
+          }
           console.log(`  Relayer status: ${result.state}`);
           if (result.transactionHash) {
             console.log(`  Tx: ${result.transactionHash}`);
