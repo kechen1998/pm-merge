@@ -7,7 +7,7 @@ import { privateKeyToAccount } from 'viem/accounts';
 import { polygon } from 'viem/chains';
 import { BuilderApiKeyCreds, BuilderConfig } from '@polymarket/builder-signing-sdk';
 import { RelayClient, RelayerTxType, Transaction } from '@polymarket/builder-relayer-client';
-import { MarketMetadata } from './types';
+import { MarketMetadata, QuotaTracker, MergeCandidate } from './types';
 
 function decryptPrivateKey(password: string): Hex {
   const privateKey = CryptoJS.AES.decrypt(CONFIG.ENCRYPT_PRIVATE_KEY, password).toString(CryptoJS.enc.Utf8);
@@ -26,6 +26,27 @@ function decryptPrivateKey(password: string): Hex {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getRelayerBackoffMs(error: unknown): number | null {
+  const err = error as {
+    status?: number;
+    data?: { error?: string };
+    error?: string;
+    message?: string;
+  };
+  if (err?.status !== 429) return null;
+
+  const message = err?.data?.error || err?.error || err?.message || '';
+  const match = /resets in (\d+) seconds/i.exec(message);
+  if (match && match[1]) {
+    const seconds = Number(match[1]);
+    if (!Number.isNaN(seconds)) {
+      return (seconds + 5) * 1000;
+    }
+  }
+
+  return 60_000;
 }
 
 function getBuilderCreds(): BuilderApiKeyCreds {
@@ -60,6 +81,46 @@ async function getTokenBalances(
     }),
   ]);
   return { yesBalance, noBalance };
+}
+
+// Quota tracking
+const quotaTracker: QuotaTracker = {
+  callsThisHour: 0,
+  hourStartTime: Date.now(),
+};
+
+function checkAndUpdateQuota(): boolean {
+  const now = Date.now();
+  const hourMs = 60 * 60 * 1000;
+
+  // Reset quota if hour has passed
+  if (now - quotaTracker.hourStartTime >= hourMs) {
+    quotaTracker.callsThisHour = 0;
+    quotaTracker.hourStartTime = now;
+    console.log('Quota reset for new hour');
+  }
+
+  // Check if we have quota remaining
+  if (quotaTracker.callsThisHour >= CONFIG.HOURLY_QUOTA_LIMIT) {
+    const resetInMs = hourMs - (now - quotaTracker.hourStartTime);
+    console.log(`Quota exhausted (${quotaTracker.callsThisHour}/${CONFIG.HOURLY_QUOTA_LIMIT}). Resets in ${(resetInMs / 1000 / 60).toFixed(1)} minutes`);
+    return false;
+  }
+
+  return true;
+}
+
+function incrementQuota(): void {
+  quotaTracker.callsThisHour++;
+  console.log(`Quota used: ${quotaTracker.callsThisHour}/${CONFIG.HOURLY_QUOTA_LIMIT}`);
+}
+
+function formatTokenAmount(amount: bigint): string {
+  // USDC has 6 decimals
+  const divisor = 1_000_000n;
+  const whole = amount / divisor;
+  const fraction = amount % divisor;
+  return `${whole}.${fraction.toString().padStart(6, '0').slice(0, 2)} USDC`;
 }
 
 async function main(): Promise<void> {
@@ -102,6 +163,9 @@ async function main(): Promise<void> {
   console.log(`Relayer type: ${relayerType}`);
   console.log(`Asset: ${asset}`);
   console.log(`Merge interval: ${CONFIG.MERGE_INTERVAL_MS / 1000 / 60} minutes`);
+  console.log(`Min merge amount: ${formatTokenAmount(CONFIG.MIN_MERGE_AMOUNT)}`);
+  console.log(`Batch size: ${CONFIG.BATCH_SIZE}`);
+  console.log(`Hourly quota limit: ${CONFIG.HOURLY_QUOTA_LIMIT}`);
 
   let isShuttingDown = false;
   const shutdown = async (signal: string): Promise<void> => {
@@ -120,31 +184,76 @@ async function main(): Promise<void> {
 
   while (!isShuttingDown) {
     try {
+      // Check quota before starting cycle
+      if (!checkAndUpdateQuota()) {
+        console.log('Waiting for quota reset...');
+        await sleep(CONFIG.MERGE_INTERVAL_MS);
+        continue;
+      }
+
       const markets = await fetchMarkets(asset);
       console.log(`\nFound ${markets.length} markets in Redis`);
 
-      let mergedCount = 0;
-      let skippedCount = 0;
-      let errorCount = 0;
+      // Phase 1: Collect eligible merge candidates
+      console.log('\nPhase 1: Scanning balances...');
+      const candidates: MergeCandidate[] = [];
+      let skippedZero = 0;
+      let skippedBelowMin = 0;
 
-      for (let i = 0; i < markets.length; i++) {
-        const market = markets[i];
-        if (i > 0) {
-          await sleep(CONFIG.REQUEST_DELAY_MS);
-        }
-
+      for (const market of markets) {
         try {
           const balances = await getTokenBalances(publicClient, CONFIG.PROXY_ADDRESS as Hex, market);
           const minBalance = balances.yesBalance < balances.noBalance ? balances.yesBalance : balances.noBalance;
+
           if (minBalance === 0n) {
-            skippedCount++;
+            skippedZero++;
             continue;
           }
 
-          console.log(`\nMarket: ${market.marketSlug || market.conditionId}`);
-          console.log(`  YES: ${balances.yesBalance.toString()}, NO: ${balances.noBalance.toString()}`);
-          console.log(`  Merging ${minBalance.toString()} tokens via relayer...`);
+          if (minBalance < CONFIG.MIN_MERGE_AMOUNT) {
+            skippedBelowMin++;
+            continue;
+          }
 
+          candidates.push({ market, minBalance });
+          console.log(`  [Eligible] ${market.marketSlug || market.conditionId}: ${formatTokenAmount(minBalance)}`);
+        } catch (error) {
+          console.error(`  Error checking ${market.marketSlug || market.conditionId}:`, error instanceof Error ? error.message : error);
+        }
+      }
+
+      console.log(`\nScan complete: ${candidates.length} eligible, ${skippedZero} zero balance, ${skippedBelowMin} below minimum`);
+
+      if (candidates.length === 0) {
+        console.log('No eligible markets to merge');
+        await sleep(CONFIG.MERGE_INTERVAL_MS);
+        continue;
+      }
+
+      // Phase 2: Batch and execute merges
+      console.log('\nPhase 2: Executing batched merges...');
+      let mergedCount = 0;
+      let errorCount = 0;
+
+      // Process in batches
+      for (let i = 0; i < candidates.length; i += CONFIG.BATCH_SIZE) {
+        // Check quota before each batch
+        if (!checkAndUpdateQuota()) {
+          console.log('Quota exhausted mid-cycle. Stopping merges.');
+          break;
+        }
+
+        const batch = candidates.slice(i, i + CONFIG.BATCH_SIZE);
+        const batchNum = Math.floor(i / CONFIG.BATCH_SIZE) + 1;
+        const totalBatches = Math.ceil(candidates.length / CONFIG.BATCH_SIZE);
+
+        console.log(`\nBatch ${batchNum}/${totalBatches} (${batch.length} transactions):`);
+
+        // Build transactions for batch
+        const transactions: Transaction[] = [];
+        const batchMarketNames: string[] = [];
+
+        for (const { market, minBalance } of batch) {
           const data = encodeFunctionData({
             abi: CTF_ABI,
             functionName: 'mergePositions',
@@ -157,32 +266,75 @@ async function main(): Promise<void> {
             ],
           });
 
-          const tx: Transaction = {
+          transactions.push({
             to: CTF_ADDRESS,
             data,
             value: '0',
-          };
+          });
 
-          const response = await relayer.execute([tx], `merge ${market.marketSlug || market.conditionId}`);
-          const result = await response.wait();
-          if (!result) {
-            throw new Error('Relayer returned no result.');
+          const name = market.marketSlug || market.conditionId.slice(0, 10);
+          batchMarketNames.push(name);
+          console.log(`  - ${name}: ${formatTokenAmount(minBalance)}`);
+        }
+
+        // Execute batch with retry
+        let attempts = 0;
+        const maxAttempts = 3;
+
+        while (attempts < maxAttempts) {
+          try {
+            const response = await relayer.execute(transactions, `merge batch ${batchNum}: ${batchMarketNames.join(', ')}`);
+            incrementQuota();
+
+            const result = await response.wait();
+            if (!result) {
+              throw new Error('Relayer returned no result.');
+            }
+
+            console.log(`  Status: ${result.state}`);
+            if (result.transactionHash) {
+              console.log(`  Tx: ${result.transactionHash}`);
+            }
+
+            mergedCount += batch.length;
+            break;
+          } catch (error) {
+            attempts++;
+            const backoffMs = getRelayerBackoffMs(error);
+
+            if (backoffMs !== null) {
+              // Check if quota is fully exhausted
+              const errData = error as { data?: { error?: string } };
+              const isQuotaExhausted = errData?.data?.error?.includes('0 units remaining');
+
+              if (isQuotaExhausted) {
+                console.error(`  Quota fully exhausted. Stopping all merges.`);
+                // Mark quota as exhausted
+                quotaTracker.callsThisHour = CONFIG.HOURLY_QUOTA_LIMIT;
+                errorCount += batch.length;
+                break;
+              }
+
+              if (attempts < maxAttempts) {
+                console.warn(`  Rate limited (attempt ${attempts}/${maxAttempts}). Backing off for ${(backoffMs / 1000).toFixed(0)}s...`);
+                await sleep(backoffMs);
+                continue;
+              }
+            }
+
+            console.error(`  Batch ${batchNum} failed:`, error instanceof Error ? error.message : JSON.stringify(error));
+            errorCount += batch.length;
+            break;
           }
-          console.log(`  Relayer status: ${result.state}`);
-          if (result.transactionHash) {
-            console.log(`  Tx: ${result.transactionHash}`);
-          }
-          if (result.proxyAddress && result.proxyAddress.toLowerCase() !== CONFIG.PROXY_ADDRESS.toLowerCase()) {
-            console.warn(`  Warning: relayer used proxy ${result.proxyAddress}, expected ${CONFIG.PROXY_ADDRESS}`);
-          }
-          mergedCount++;
-        } catch (error) {
-          console.error(`  Error merging ${market.marketSlug || market.conditionId}:`, error instanceof Error ? error.message : error);
-          errorCount++;
+        }
+
+        // Delay between batches
+        if (i + CONFIG.BATCH_SIZE < candidates.length) {
+          await sleep(CONFIG.REQUEST_DELAY_MS);
         }
       }
 
-      console.log(`\nMerge cycle complete: ${mergedCount} merged, ${skippedCount} skipped, ${errorCount} errors`);
+      console.log(`\nMerge cycle complete: ${mergedCount} merged, ${errorCount} errors`);
     } catch (error) {
       console.error('Error in merge cycle:', error instanceof Error ? error.message : error);
     }

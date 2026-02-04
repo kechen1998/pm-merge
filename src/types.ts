@@ -47,4 +47,17 @@ export interface Config {
   // Merge settings
   MERGE_INTERVAL_MS: number;
   REQUEST_DELAY_MS: number;
+  MIN_MERGE_AMOUNT: bigint;
+  BATCH_SIZE: number;
+  HOURLY_QUOTA_LIMIT: number;
+}
+
+export interface QuotaTracker {
+  callsThisHour: number;
+  hourStartTime: number;
+}
+
+export interface MergeCandidate {
+  market: MarketMetadata;
+  minBalance: bigint;
 }
