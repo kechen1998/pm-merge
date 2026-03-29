@@ -43,6 +43,7 @@ export interface Config {
   // Relayer configuration
   RELAYER_URL: string;
   RELAYER_TX_TYPE: string;
+  RELAYER_API_KEY: string;
 
   // Merge settings
   MERGE_INTERVAL_MS: number;

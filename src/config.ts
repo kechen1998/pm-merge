@@ -39,6 +39,7 @@ export const CONFIG: Config = {
   // Relayer configuration
   RELAYER_URL: process.env.RELAYER_URL || '',
   RELAYER_TX_TYPE: process.env.RELAYER_TX_TYPE || 'SAFE',
+  RELAYER_API_KEY: process.env.RELAYER_API_KEY || '',
 
   // Merge settings
   MERGE_INTERVAL_MS: Number(process.env.MERGE_INTERVAL_MS) || 30 * 60 * 1000, // 30 minutes

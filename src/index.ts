@@ -9,6 +9,27 @@ import { BuilderApiKeyCreds, BuilderConfig } from '@polymarket/builder-signing-s
 import { RelayClient, RelayerTxType, Transaction } from '@polymarket/builder-relayer-client';
 import { MarketMetadata, QuotaTracker, MergeCandidate } from './types';
 
+class RelayerApiKeyConfig {
+  private apiKey: string;
+  private address: string;
+
+  constructor(apiKey: string, address: string) {
+    this.apiKey = apiKey;
+    this.address = address;
+  }
+
+  async generateBuilderHeaders(_method?: string, _path?: string, _body?: string): Promise<Record<string, string>> {
+    return {
+      RELAYER_API_KEY: this.apiKey,
+      RELAYER_API_KEY_ADDRESS: this.address,
+    };
+  }
+
+  isValid(): boolean {
+    return !!this.apiKey && !!this.address;
+  }
+}
+
 function decryptPrivateKey(password: string): Hex {
   const privateKey = CryptoJS.AES.decrypt(CONFIG.ENCRYPT_PRIVATE_KEY, password).toString(CryptoJS.enc.Utf8);
   if (!privateKey) {
@@ -152,10 +173,19 @@ async function main(): Promise<void> {
     transport: http(CONFIG.RPC_URL),
   });
 
-  const builderConfig = new BuilderConfig({ localBuilderCreds: getBuilderCreds() });
   const relayerUrl = CONFIG.RELAYER_URL || 'https://relayer-v2.polymarket.com/';
   const relayerType = CONFIG.RELAYER_TX_TYPE === 'PROXY' ? RelayerTxType.PROXY : RelayerTxType.SAFE;
-  const relayer = new RelayClient(relayerUrl, CONFIG.CHAIN_ID, walletClient, builderConfig, relayerType);
+
+  let authConfig: BuilderConfig | RelayerApiKeyConfig;
+  if (CONFIG.RELAYER_API_KEY) {
+    authConfig = new RelayerApiKeyConfig(CONFIG.RELAYER_API_KEY, account.address);
+    console.log('Using Relayer API Key authentication');
+  } else {
+    authConfig = new BuilderConfig({ localBuilderCreds: getBuilderCreds() });
+    console.log('Using Builder API Key authentication');
+  }
+
+  const relayer = new RelayClient(relayerUrl, CONFIG.CHAIN_ID, walletClient, authConfig as BuilderConfig, relayerType);
 
   console.log(`EOA address: ${account.address}`);
   console.log(`Proxy address: ${CONFIG.PROXY_ADDRESS}`);
