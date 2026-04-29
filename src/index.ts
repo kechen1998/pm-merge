@@ -6,8 +6,10 @@ import {
   CTF_ADDRESS,
   PARTITION,
   PARENT_COLLECTION_ID,
-  NEG_RISK_ADAPTER_ABI,
-  NEG_RISK_ADAPTER_ADDRESS,
+  COLLATERAL_ADAPTER_ABI,
+  CTF_COLLATERAL_ADAPTER_ADDRESS,
+  NEG_RISK_CTF_COLLATERAL_ADAPTER_ADDRESS,
+  USDC_E_ADDRESS,
   COLLATERAL_CANDIDATES,
 } from './ctf';
 import { createPublicClient, createWalletClient, encodeFunctionData, Hex, http, isHex } from 'viem';
@@ -101,37 +103,46 @@ async function resolveCollateral(
   return null;
 }
 
-async function ensureNegRiskAdapterApproval(
+async function ensureCollateralAdapterApprovals(
   publicClient: ReturnType<typeof createPublicClient>,
   relayer: RelayClient,
   proxyAddress: Hex
 ): Promise<void> {
-  const isApproved = await publicClient.readContract({
-    address: CTF_ADDRESS,
-    abi: CTF_ABI,
-    functionName: 'isApprovedForAll',
-    args: [proxyAddress, NEG_RISK_ADAPTER_ADDRESS],
-  });
+  const operators: { name: string; address: Hex }[] = [
+    { name: 'NegRiskCtfCollateralAdapter', address: NEG_RISK_CTF_COLLATERAL_ADAPTER_ADDRESS as Hex },
+    { name: 'CtfCollateralAdapter', address: CTF_COLLATERAL_ADAPTER_ADDRESS as Hex },
+  ];
 
-  if (isApproved) {
-    console.log('NegRiskAdapter already approved on CTF');
-    return;
+  const transactions: Transaction[] = [];
+  for (const { name, address } of operators) {
+    const isApproved = await publicClient.readContract({
+      address: CTF_ADDRESS,
+      abi: CTF_ABI,
+      functionName: 'isApprovedForAll',
+      args: [proxyAddress, address],
+    });
+    if (isApproved) {
+      console.log(`${name} already approved on CTF`);
+      continue;
+    }
+    console.log(`${name} not approved; queuing CTF.setApprovalForAll...`);
+    transactions.push({
+      to: CTF_ADDRESS,
+      data: encodeFunctionData({
+        abi: CTF_ABI,
+        functionName: 'setApprovalForAll',
+        args: [address, true],
+      }),
+      value: '0',
+    });
   }
 
-  console.log('NegRiskAdapter not approved; submitting CTF.setApprovalForAll...');
-  const data = encodeFunctionData({
-    abi: CTF_ABI,
-    functionName: 'setApprovalForAll',
-    args: [NEG_RISK_ADAPTER_ADDRESS, true],
-  });
+  if (transactions.length === 0) return;
 
-  const response = await relayer.execute(
-    [{ to: CTF_ADDRESS, data, value: '0' }],
-    'approve NegRiskAdapter on CTF'
-  );
+  const response = await relayer.execute(transactions, 'approve v2 collateral adapters on CTF');
   const result = await response.wait();
   if (!result) {
-    throw new Error('Relayer returned no result for NegRiskAdapter approval.');
+    throw new Error('Relayer returned no result for collateral adapter approval.');
   }
   console.log(`Approval status: ${result.state}`);
   if (result.transactionHash) {
@@ -235,7 +246,8 @@ async function main(): Promise<void> {
   const builderConfig = new BuilderConfig({ localBuilderCreds: getBuilderCreds() });
   const relayerUrl = CONFIG.RELAYER_URL || 'https://relayer-v2.polymarket.com/';
   const relayerType = CONFIG.RELAYER_TX_TYPE === 'PROXY' ? RelayerTxType.PROXY : RelayerTxType.SAFE;
-  const relayer = new RelayClient(relayerUrl, CONFIG.CHAIN_ID, walletClient, builderConfig, relayerType);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const relayer = new RelayClient(relayerUrl, CONFIG.CHAIN_ID, walletClient, builderConfig as any, relayerType);
 
   console.log(`EOA address: ${account.address}`);
   console.log(`Proxy address: ${CONFIG.PROXY_ADDRESS}`);
@@ -261,9 +273,9 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
 
   try {
-    await ensureNegRiskAdapterApproval(publicClient, relayer, CONFIG.PROXY_ADDRESS as Hex);
+    await ensureCollateralAdapterApprovals(publicClient, relayer, CONFIG.PROXY_ADDRESS as Hex);
   } catch (error) {
-    console.error('Failed to verify/set NegRiskAdapter approval:', error instanceof Error ? error.message : error);
+    console.error('Failed to verify/set collateral adapter approvals:', error instanceof Error ? error.message : error);
     process.exit(1);
   }
 
@@ -344,39 +356,71 @@ async function main(): Promise<void> {
           const isNegRisk = Boolean(market.negRisk);
           let data: Hex;
           let to: string;
+          let routeLabel: string;
 
           if (isNegRisk) {
+            // V2 NegRiskCtfCollateralAdapter: merges via the legacy NegRiskAdapter
+            // and wraps the resulting USDC.e into pUSD in a single tx, so no manual
+            // "Confirm Deposit" is needed afterwards.
             data = encodeFunctionData({
-              abi: NEG_RISK_ADAPTER_ABI,
-              functionName: 'mergePositions',
-              args: [market.conditionId as Hex, minBalance],
-            });
-            to = NEG_RISK_ADAPTER_ADDRESS;
-          } else {
-            const collateral = await resolveCollateral(publicClient, market);
-            if (!collateral) {
-              console.warn(`  - ${market.marketSlug || market.conditionId.slice(0, 10)}: skipped (no matching collateral on-chain)`);
-              continue;
-            }
-            data = encodeFunctionData({
-              abi: CTF_ABI,
+              abi: COLLATERAL_ADAPTER_ABI,
               functionName: 'mergePositions',
               args: [
-                collateral,
+                USDC_E_ADDRESS as Hex,
                 PARENT_COLLECTION_ID,
                 market.conditionId as Hex,
                 PARTITION,
                 minBalance,
               ],
             });
-            to = CTF_ADDRESS;
+            to = NEG_RISK_CTF_COLLATERAL_ADAPTER_ADDRESS;
+            routeLabel = ' [neg-risk → pUSD]';
+          } else {
+            const collateral = await resolveCollateral(publicClient, market);
+            if (!collateral) {
+              console.warn(`  - ${market.marketSlug || market.conditionId.slice(0, 10)}: skipped (no matching collateral on-chain)`);
+              continue;
+            }
+
+            if (collateral.toLowerCase() === USDC_E_ADDRESS.toLowerCase()) {
+              // USDC.e-backed market: route through V2 CtfCollateralAdapter so the
+              // merged USDC.e is wrapped into pUSD atomically.
+              data = encodeFunctionData({
+                abi: COLLATERAL_ADAPTER_ABI,
+                functionName: 'mergePositions',
+                args: [
+                  collateral,
+                  PARENT_COLLECTION_ID,
+                  market.conditionId as Hex,
+                  PARTITION,
+                  minBalance,
+                ],
+              });
+              to = CTF_COLLATERAL_ADAPTER_ADDRESS;
+              routeLabel = ' [USDC.e → pUSD]';
+            } else {
+              // pUSD-backed market: legacy CTF call already returns pUSD, no wrap needed.
+              data = encodeFunctionData({
+                abi: CTF_ABI,
+                functionName: 'mergePositions',
+                args: [
+                  collateral,
+                  PARENT_COLLECTION_ID,
+                  market.conditionId as Hex,
+                  PARTITION,
+                  minBalance,
+                ],
+              });
+              to = CTF_ADDRESS;
+              routeLabel = ' [pUSD]';
+            }
           }
 
           transactions.push({ to, data, value: '0' });
 
           const name = market.marketSlug || market.conditionId.slice(0, 10);
           batchMarketNames.push(name);
-          console.log(`  - ${name}${isNegRisk ? ' [neg-risk]' : ''}: ${formatTokenAmount(minBalance)}`);
+          console.log(`  - ${name}${routeLabel}: ${formatTokenAmount(minBalance)}`);
         }
 
         if (transactions.length === 0) {
