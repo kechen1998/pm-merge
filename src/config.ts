@@ -41,7 +41,7 @@ export const CONFIG: Config = {
   RELAYER_TX_TYPE: process.env.RELAYER_TX_TYPE || 'SAFE',
 
   // Merge settings
-  MERGE_INTERVAL_MS: Number(process.env.MERGE_INTERVAL_MS) || 30 * 60 * 1000, // 30 minutes
+  MERGE_INTERVAL_MS: Number(process.env.MERGE_INTERVAL_MS) || 15 * 60 * 1000, // 15 minutes
   REQUEST_DELAY_MS: Number(process.env.REQUEST_DELAY_MS) || 5000, // 5s delay between batches
   MIN_MERGE_AMOUNT: parseMinMergeAmount(), // Minimum balance to merge (default: 10 pUSD)
   BATCH_SIZE: Number(process.env.BATCH_SIZE) || 10, // Max transactions per batch

@@ -1,5 +1,6 @@
 /tmp
 /out-tsc
+/dist
 /.env
 
 /node_modules

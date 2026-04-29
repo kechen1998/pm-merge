@@ -14,6 +14,14 @@ export const USDC_E_ADDRESS = '0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174';
 export const PUSD_ADDRESS = '0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB';
 export const COLLATERAL_CANDIDATES = [USDC_E_ADDRESS, PUSD_ADDRESS] as const;
 
+// V2 collateral adapters (post-2026-04-28). Merge USDC.e-backed positions and
+// wrap the resulting USDC.e into pUSD in a single transaction, eliminating the
+// "Confirm Deposit" step that the web UI shows after a raw CTF/NegRiskAdapter merge.
+export const CTF_COLLATERAL_ADAPTER_ADDRESS =
+  '0xADa100874d00e3331D00F2007a9c336a65009718';
+export const NEG_RISK_CTF_COLLATERAL_ADAPTER_ADDRESS =
+  '0xAdA200001000ef00D07553cEE7006808F895c6F1';
+
 export const CTF_ABI = [
   {
     type: 'function',
@@ -88,6 +96,26 @@ export const NEG_RISK_ADAPTER_ABI = [
     stateMutability: 'nonpayable',
     inputs: [
       { name: 'conditionId', type: 'bytes32' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [],
+  },
+] as const;
+
+// Shared ABI for v2 collateral adapters. Both CtfCollateralAdapter and
+// NegRiskCtfCollateralAdapter (which inherits from it) expose the same
+// IConditionalTokens-shaped mergePositions signature; the first three params
+// are ignored by the implementation but must be passed for ABI compatibility.
+export const COLLATERAL_ADAPTER_ABI = [
+  {
+    type: 'function',
+    name: 'mergePositions',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'collateralToken', type: 'address' },
+      { name: 'parentCollectionId', type: 'bytes32' },
+      { name: 'conditionId', type: 'bytes32' },
+      { name: 'partition', type: 'uint256[]' },
       { name: 'amount', type: 'uint256' },
     ],
     outputs: [],
