@@ -9,13 +9,13 @@ import { Config } from './types';
 // Load environment variables from .env file
 dotenv.config({ path: path.resolve(__dirname, '../.env') });
 
-// USDC has 6 decimals, so 10 USDC = 10_000_000
+// pUSD has 6 decimals, so 10 pUSD = 10_000_000
 const parseMinMergeAmount = (): bigint => {
   const envValue = process.env.MIN_MERGE_AMOUNT;
   if (envValue) {
     return BigInt(envValue);
   }
-  return 10_000_000n; // Default: 10 USDC
+  return 10_000_000n; // Default: 10 pUSD
 };
 
 export const CONFIG: Config = {
@@ -43,7 +43,7 @@ export const CONFIG: Config = {
   // Merge settings
   MERGE_INTERVAL_MS: Number(process.env.MERGE_INTERVAL_MS) || 30 * 60 * 1000, // 30 minutes
   REQUEST_DELAY_MS: Number(process.env.REQUEST_DELAY_MS) || 5000, // 5s delay between batches
-  MIN_MERGE_AMOUNT: parseMinMergeAmount(), // Minimum balance to merge (default: 10 USDC)
+  MIN_MERGE_AMOUNT: parseMinMergeAmount(), // Minimum balance to merge (default: 10 pUSD)
   BATCH_SIZE: Number(process.env.BATCH_SIZE) || 10, // Max transactions per batch
   HOURLY_QUOTA_LIMIT: Number(process.env.HOURLY_QUOTA_LIMIT) || 20, // Max API calls per hour
 };

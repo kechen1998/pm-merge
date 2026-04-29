@@ -41,6 +41,10 @@ export async function fetchMarkets(asset: string): Promise<MarketMetadata[]> {
         console.error(`Invalid metadata for ${conditionId}: missing token IDs or condition ID`);
         continue;
       }
+      if (!metadata.collateral) {
+        console.error(`Invalid metadata for ${conditionId}: missing collateral. Re-run pm-market-stream to backfill.`);
+        continue;
+      }
       markets.push(metadata);
     } catch (e) {
       console.error(`Failed to parse metadata for ${conditionId}:`, e);

@@ -8,6 +8,7 @@ export interface MarketMetadata {
   yesTokenId: string;
   noTokenId: string;
   conditionId: string;
+  collateral: string;
   marketSlug?: string;
   eventSlug?: string;
   eventId?: string;
@@ -15,6 +16,7 @@ export interface MarketMetadata {
   strike?: number;
   expiry?: string;
   tickSize?: number;
+  negRisk?: boolean;
 }
 
 export interface TokenBalance {

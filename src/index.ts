@@ -1,7 +1,15 @@
 import CryptoJS from 'crypto-js';
 import { CONFIG } from './config';
 import { fetchMarkets, closeRedis } from './redis';
-import { CTF_ABI, CTF_ADDRESS, PARTITION, PARENT_COLLECTION_ID, USDC_ADDRESS } from './ctf';
+import {
+  CTF_ABI,
+  CTF_ADDRESS,
+  PARTITION,
+  PARENT_COLLECTION_ID,
+  NEG_RISK_ADAPTER_ABI,
+  NEG_RISK_ADAPTER_ADDRESS,
+  COLLATERAL_CANDIDATES,
+} from './ctf';
 import { createPublicClient, createWalletClient, encodeFunctionData, Hex, http, isHex } from 'viem';
 import { privateKeyToAccount } from 'viem/accounts';
 import { polygon } from 'viem/chains';
@@ -57,6 +65,78 @@ function getBuilderCreds(): BuilderApiKeyCreds {
     throw new Error('Missing builder API credentials. Set POLY_BUILDER_API_KEY/SECRET/PASSPHRASE.');
   }
   return { key, secret, passphrase };
+}
+
+// Cache of conditionId -> on-chain collateral address (USDC.e or pUSD)
+const collateralByCondition = new Map<string, Hex>();
+
+async function resolveCollateral(
+  publicClient: ReturnType<typeof createPublicClient>,
+  market: MarketMetadata
+): Promise<Hex | null> {
+  const cached = collateralByCondition.get(market.conditionId);
+  if (cached) return cached;
+
+  const yesTokenId = BigInt(market.yesTokenId);
+  const yesCollection = await publicClient.readContract({
+    address: CTF_ADDRESS,
+    abi: CTF_ABI,
+    functionName: 'getCollectionId',
+    args: [PARENT_COLLECTION_ID, market.conditionId as Hex, 1n],
+  });
+
+  for (const candidate of COLLATERAL_CANDIDATES) {
+    const positionId = await publicClient.readContract({
+      address: CTF_ADDRESS,
+      abi: CTF_ABI,
+      functionName: 'getPositionId',
+      args: [candidate as Hex, yesCollection],
+    });
+    if (positionId === yesTokenId) {
+      collateralByCondition.set(market.conditionId, candidate as Hex);
+      return candidate as Hex;
+    }
+  }
+
+  return null;
+}
+
+async function ensureNegRiskAdapterApproval(
+  publicClient: ReturnType<typeof createPublicClient>,
+  relayer: RelayClient,
+  proxyAddress: Hex
+): Promise<void> {
+  const isApproved = await publicClient.readContract({
+    address: CTF_ADDRESS,
+    abi: CTF_ABI,
+    functionName: 'isApprovedForAll',
+    args: [proxyAddress, NEG_RISK_ADAPTER_ADDRESS],
+  });
+
+  if (isApproved) {
+    console.log('NegRiskAdapter already approved on CTF');
+    return;
+  }
+
+  console.log('NegRiskAdapter not approved; submitting CTF.setApprovalForAll...');
+  const data = encodeFunctionData({
+    abi: CTF_ABI,
+    functionName: 'setApprovalForAll',
+    args: [NEG_RISK_ADAPTER_ADDRESS, true],
+  });
+
+  const response = await relayer.execute(
+    [{ to: CTF_ADDRESS, data, value: '0' }],
+    'approve NegRiskAdapter on CTF'
+  );
+  const result = await response.wait();
+  if (!result) {
+    throw new Error('Relayer returned no result for NegRiskAdapter approval.');
+  }
+  console.log(`Approval status: ${result.state}`);
+  if (result.transactionHash) {
+    console.log(`Approval tx: ${result.transactionHash}`);
+  }
 }
 
 async function getTokenBalances(
@@ -116,11 +196,11 @@ function incrementQuota(): void {
 }
 
 function formatTokenAmount(amount: bigint): string {
-  // USDC has 6 decimals
+  // pUSD has 6 decimals
   const divisor = 1_000_000n;
   const whole = amount / divisor;
   const fraction = amount % divisor;
-  return `${whole}.${fraction.toString().padStart(6, '0').slice(0, 2)} USDC`;
+  return `${whole}.${fraction.toString().padStart(6, '0').slice(0, 2)} pUSD`;
 }
 
 async function main(): Promise<void> {
@@ -179,6 +259,13 @@ async function main(): Promise<void> {
 
   process.on('SIGINT', () => shutdown('SIGINT'));
   process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+  try {
+    await ensureNegRiskAdapterApproval(publicClient, relayer, CONFIG.PROXY_ADDRESS as Hex);
+  } catch (error) {
+    console.error('Failed to verify/set NegRiskAdapter approval:', error instanceof Error ? error.message : error);
+    process.exit(1);
+  }
 
   console.log('\nStarting merge loop...');
 
@@ -254,27 +341,47 @@ async function main(): Promise<void> {
         const batchMarketNames: string[] = [];
 
         for (const { market, minBalance } of batch) {
-          const data = encodeFunctionData({
-            abi: CTF_ABI,
-            functionName: 'mergePositions',
-            args: [
-              USDC_ADDRESS,
-              PARENT_COLLECTION_ID,
-              market.conditionId as Hex,
-              PARTITION,
-              minBalance,
-            ],
-          });
+          const isNegRisk = Boolean(market.negRisk);
+          let data: Hex;
+          let to: string;
 
-          transactions.push({
-            to: CTF_ADDRESS,
-            data,
-            value: '0',
-          });
+          if (isNegRisk) {
+            data = encodeFunctionData({
+              abi: NEG_RISK_ADAPTER_ABI,
+              functionName: 'mergePositions',
+              args: [market.conditionId as Hex, minBalance],
+            });
+            to = NEG_RISK_ADAPTER_ADDRESS;
+          } else {
+            const collateral = await resolveCollateral(publicClient, market);
+            if (!collateral) {
+              console.warn(`  - ${market.marketSlug || market.conditionId.slice(0, 10)}: skipped (no matching collateral on-chain)`);
+              continue;
+            }
+            data = encodeFunctionData({
+              abi: CTF_ABI,
+              functionName: 'mergePositions',
+              args: [
+                collateral,
+                PARENT_COLLECTION_ID,
+                market.conditionId as Hex,
+                PARTITION,
+                minBalance,
+              ],
+            });
+            to = CTF_ADDRESS;
+          }
+
+          transactions.push({ to, data, value: '0' });
 
           const name = market.marketSlug || market.conditionId.slice(0, 10);
           batchMarketNames.push(name);
-          console.log(`  - ${name}: ${formatTokenAmount(minBalance)}`);
+          console.log(`  - ${name}${isNegRisk ? ' [neg-risk]' : ''}: ${formatTokenAmount(minBalance)}`);
+        }
+
+        if (transactions.length === 0) {
+          console.log('  No transactions in batch after collateral resolution; skipping.');
+          continue;
         }
 
         // Execute batch with retry
